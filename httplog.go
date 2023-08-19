@@ -51,12 +51,6 @@ func (l *RequestLoggerEntry) Write(status, bytes int, header http.Header, elapse
 		slog.Float64("elapsed", float64(elapsed.Nanoseconds())/1000000.0),
 	)
 
-	// Include response header, as well for error status codes (>400) we include
-	// the response body so we may inspect the log message sent back to the client.
-	if status >= 400 {
-		body, _ := extra.([]byte)
-		responseAttr = append(responseAttr, slog.String("body", string(body)))
-	}
 	if len(header) > 0 {
 		responseAttr = append(responseAttr, headerLogAttrs(header))
 	}

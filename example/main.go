@@ -17,27 +17,32 @@ import (
 func main() {
 	r := chi.NewRouter()
 
-	sensitiveHeaders := map[string]struct{}{"token": {}}
-	l := httplog.NewLogger(httplog.Options{
-		ServiceName: "hello",
-		Level:       httplog.LevelTrace,
-		Format:      httplog.FormatJSON,
-		Concise:     false,
-		Tags: map[string]string{
+	l := httplog.NewLogger(
+		httplog.WithFormat("json"),
+		httplog.WithLevel(slog.LevelDebug),
+		httplog.WithServiceName("wallet"),
+		httplog.WithTags(map[string]string{
 			"version": "v1.0-81aa4244d9fc8076a",
 			"env":     "dev",
-		},
-		SensitiveHeaders:    sensitiveHeaders,
-		LeakSensitiveValues: false,
-	})
+		}),
+	)
 
 	r.Use(middleware.RequestID)
-	r.Use(httplog.RequestLogger(l))
+	r.Use(httplog.RequestLogger(
+		httplog.WithLogger(l),
+		httplog.WithConcise(false),
+		httplog.WithLeak(false),
+		httplog.WithSensitive(map[string]struct{}{
+			"insecure":       {},
+			"very-insercure": {},
+		}),
+	))
 	r.Use(middleware.Recoverer)
 	r.Use(middleware.URLFormat)
 
 	// New headers will be added under response.headers on the log entry
 	r.Get("/", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
 		w.Header().Set("new", "header")
 	})
 	// Stacktrace will be added to the log entry of level fatal
@@ -46,6 +51,7 @@ func main() {
 	})
 	// Adding new attr to the log entry
 	r.Get("/attr", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
 		httplog.LogEntrySetAttr(r, slog.String("new", "attr"))
 	})
 	// For trying graceful shutdown

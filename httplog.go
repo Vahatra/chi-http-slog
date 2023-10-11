@@ -10,105 +10,121 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 )
 
-func RequestLogger(l *slog.Logger) func(next http.Handler) http.Handler {
-	return middleware.RequestLogger(&requestLogger{Logger: l})
+type loggerOptions struct {
+	l         *slog.Logger
+	concise   bool                // detailed or concise logs
+	sensitive map[string]struct{} // a set for storing fields that should not be logged
+	leak      bool                // ignore "sensitive" and log everything
 }
 
-type requestLogger struct {
-	Logger *slog.Logger
+type LoggerOption func(*loggerOptions)
+
+func evaluateLoggerOptions(opts []LoggerOption) *loggerOptions {
+	opt := &loggerOptions{
+		l:         slog.Default(),
+		concise:   false,
+		sensitive: nil,
+		leak:      false,
+	}
+	for _, o := range opts {
+		o(opt)
+	}
+	return opt
 }
 
-func (l *requestLogger) NewLogEntry(r *http.Request) middleware.LogEntry {
-	entry := &RequestLoggerEntry{}
-	entry.Logger = l.Logger.With(requestLogAttrs(r))
+func RequestLogger(opts ...LoggerOption) func(next http.Handler) http.Handler {
+	o := evaluateLoggerOptions(opts)
+	return middleware.RequestLogger(&loggerOptions{
+		l:         o.l,
+		concise:   o.concise,
+		sensitive: o.sensitive,
+		leak:      o.leak,
+	})
+}
+
+func (o *loggerOptions) NewLogEntry(r *http.Request) middleware.LogEntry {
+	entry := &LogEntry{
+		l:         o.l,
+		concise:   o.concise,
+		sensitive: o.sensitive,
+		leak:      o.leak,
+	}
+	entry.req(r)
 
 	return entry
 }
 
-type RequestLoggerEntry struct {
-	Logger *slog.Logger
-	msg    string
+type LogEntry struct {
+	l         *slog.Logger
+	msg       string
+	concise   bool                // detailed or concise logs
+	sensitive map[string]struct{} // a set for storing fields that should not be logged
+	leak      bool                // ignore "sensitive" and log everything
 }
 
-func (l *RequestLoggerEntry) Write(status, bytes int, header http.Header, elapsed time.Duration, extra interface{}) {
-	// responseLogAttrs
-	msg := fmt.Sprintf("%d %s", status, statusLabel(status))
-	if l.msg != "" {
-		msg = fmt.Sprintf("%s - %s", msg, l.msg)
-	}
-
-	responseAttr := []any{ // slog.Attr
-		slog.Int("status", status),
-	}
-
-	if Opt.Concise {
-		l.Logger.LogAttrs(nil, statusLevel(status), msg, slog.Group("response", responseAttr...))
-		return
-	}
-
+func (le *LogEntry) Write(status, bytes int, header http.Header, elapsed time.Duration, extra interface{}) {
+	responseAttr := make([]any, 0, 3) // slog.Attr
 	responseAttr = append(responseAttr,
-		slog.Int("bytes", bytes),
-		slog.Float64("elapsed", float64(elapsed.Nanoseconds())/1000000.0),
-	)
-
-	if len(header) > 0 {
-		responseAttr = append(responseAttr, headerLogAttrs(header))
+		slog.Int("size", bytes),
+		slog.Group("status",
+			slog.Int("code", status),
+			slog.String("msg", http.StatusText(status)),
+		))
+	if !le.concise {
+		responseAttr = append(responseAttr, httpHeaderAttrs(header, le.leak, le.sensitive))
 	}
+	le.l = le.l.With(slog.Group("response", responseAttr...))
 
-	l.Logger.LogAttrs(nil, statusLevel(status), msg, slog.Group("response", responseAttr...))
+	msg := fmt.Sprintf("%d %s", status, http.StatusText(status))
+	if le.msg != "" {
+		msg = fmt.Sprintf("%s - %s", msg, le.msg)
+	}
+	le.l.LogAttrs(
+		nil,
+		toLogLevel(status),
+		msg,
+	)
 }
 
-func (l *RequestLoggerEntry) Panic(v interface{}, stack []byte) {
+func (le *LogEntry) Panic(v interface{}, stack []byte) {
 	stacktrace := "#"
-	if Opt.Format == FormatJSON {
-		stacktrace = string(stack)
-	}
-
-	l.Logger = l.Logger.With(slog.String("stacktrace", stacktrace), slog.String("panic", fmt.Sprintf("%+v", v)))
-
-	if Opt.Format == FormatText {
-		middleware.PrintPrettyStack(v)
-	}
+	stacktrace = string(stack)
+	le.l = le.l.With(slog.String("stacktrace", stacktrace), slog.String("panic", fmt.Sprintf("%+v", v)))
 }
 
-func requestLogAttrs(r *http.Request) slog.Attr {
-	scheme := "http"
-	if r.TLS != nil {
-		scheme = "https"
-	}
-	requestURL := fmt.Sprintf("%s://%s%s", scheme, r.Host, r.RequestURI)
-	requestAttr := []any{ // []slog.Attr
-		slog.String("method", r.Method),
-		slog.String("url", requestURL),
+func (le *LogEntry) req(r *http.Request) {
+	reqID := middleware.GetReqID(r.Context())
+	if reqID != "" {
+		le.l = le.l.With(slog.String("id", reqID))
 	}
 
-	if Opt.Concise {
-		return slog.Group("request", requestAttr...)
-	}
-
+	requestAttr := make([]any, 0, 7) // slog.Attr
 	requestAttr = append(requestAttr,
-		headerLogAttrs(r.Header),
-		slog.String("proto", r.Proto),
-		slog.String("scheme", scheme),
-		slog.String("path", r.URL.Path),
-		slog.String("remote", r.RemoteAddr),
+		slog.String("uri", r.RequestURI),
+		slog.String("method", r.Method),
 	)
-	if reqID := middleware.GetReqID(r.Context()); reqID != "" {
-		requestAttr = append(requestAttr, slog.String("id", reqID))
-	}
 
-	return slog.Group("request", requestAttr...)
+	if !le.concise {
+		requestAttr = append(requestAttr,
+			slog.String("host", r.Host),
+			slog.String("path", r.URL.Path),
+			slog.String("proto", r.Proto),
+			slog.String("remote", r.RemoteAddr),
+			httpHeaderAttrs(r.Header, le.leak, le.sensitive),
+		)
+	}
+	le.l = le.l.With(slog.Group("request", requestAttr...))
 }
 
-func headerLogAttrs(header http.Header) slog.Attr {
-	var hearderAttr []any // []slog.Attr
+func httpHeaderAttrs(header http.Header, leak bool, sensitive map[string]struct{}) slog.Attr {
+	hearderAttr := make([]any, 0, len(header)) // []slog.Attr
 
 	for k, v := range header {
 		k = strings.ToLower(k)
-		_, ok := Opt.SensitiveHeaders[k]
+		_, ok := sensitive[k]
 
 		switch {
-		case ok && !Opt.LeakSensitiveValues: // filtering sensitive headers
+		case ok && !leak: // filtering sensitive headers
 			continue
 		case len(v) == 0:
 			continue
@@ -122,33 +138,18 @@ func headerLogAttrs(header http.Header) slog.Attr {
 	return slog.Group("headers", hearderAttr...)
 }
 
-func statusLevel(status int) slog.Level {
+func toLogLevel(status int) slog.Level {
 	switch {
 	case status <= 0:
-		return LevelWarn
+		return slog.LevelWarn
 	case status < 400: // for codes in 100s, 200s, 300s
-		return LevelInfo
+		return slog.LevelInfo
 	case status >= 400 && status < 500:
-		return LevelWarn
+		return slog.LevelWarn
 	case status >= 500:
-		return LevelFatal
+		return slog.LevelError
 	default:
-		return LevelInfo
-	}
-}
-
-func statusLabel(status int) string {
-	switch {
-	case status >= 100 && status < 300:
-		return "OK"
-	case status >= 300 && status < 400:
-		return "Redirect"
-	case status >= 400 && status < 500:
-		return "Client Error"
-	case status >= 500:
-		return "Server Error"
-	default:
-		return "Unknown"
+		return slog.LevelInfo
 	}
 }
 
@@ -160,12 +161,51 @@ func statusLabel(status int) string {
 // with a call to .Print(), .Info(), etc.
 
 func GetLogEntry(r *http.Request) *slog.Logger {
-	entry := middleware.GetLogEntry(r).(*RequestLoggerEntry)
-	return entry.Logger
+	entry := middleware.GetLogEntry(r).(*LogEntry)
+	return entry.l
 }
 
 func LogEntrySetAttr(r *http.Request, attr slog.Attr) {
-	if entry, ok := r.Context().Value(middleware.LogEntryCtxKey).(*RequestLoggerEntry); ok {
-		entry.Logger = entry.Logger.With(attr)
+	if entry, ok := r.Context().Value(middleware.LogEntryCtxKey).(*LogEntry); ok {
+		entry.l = entry.l.With(attr)
+	}
+}
+
+// Options
+
+// WithLoggerLogger is a functional option to use another *slog.Logger
+func WithLogger(l *slog.Logger) LoggerOption {
+	return func(o *loggerOptions) {
+		o.l = l
+	}
+}
+
+func WithConcise(concise bool) LoggerOption {
+	return func(o *loggerOptions) {
+		o.concise = concise
+	}
+}
+
+func WithSensitive(s map[string]struct{}) LoggerOption {
+	return func(o *loggerOptions) {
+		// https://github.com/uber-go/guide/blob/master/style.md#copy-slices-and-maps-at-boundaries
+		if s == nil {
+			o.sensitive = make(map[string]struct{}, 3)
+		} else {
+			o.sensitive = make(map[string]struct{}, len(s))
+			for k := range s {
+				o.sensitive[k] = struct{}{}
+			}
+		}
+		s["authorization"] = struct{}{}
+		s["cookie"] = struct{}{}
+		s["set-cookie"] = struct{}{}
+	}
+}
+
+// only for dev purposes
+func WithLeak(leakSensitiveData bool) LoggerOption {
+	return func(o *loggerOptions) {
+		o.leak = leakSensitiveData
 	}
 }

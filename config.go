@@ -5,6 +5,8 @@ import (
 	"os"
 )
 
+// TODO once https://github.com/uber-go/zap/issues/1333 is done, consider adding zap as a backend.
+
 const (
 	LevelTrace slog.Level = -8
 	LevelDebug slog.Level = -4
@@ -19,74 +21,51 @@ var LevelNames = map[slog.Leveler]string{
 	LevelFatal: "FATAL",
 }
 
-type Format string
+type options struct {
+	// serviceName is the value associated with the log key "service". Can be omitted.
+	serviceName string
 
-const (
-	FormatJSON = Format("json")
-	FormatText = Format("text")
-)
-
-type Options struct {
-	// Value associated with the log key "service". Can be omitted.
-	ServiceName string
-
-	// Defines the minimum level of severity that app should log.
+	// level defines the minimum level of severity that app should log.
 	//
-	// Must be one of type slog.Level: LevelTrace, LevelDebug, LevelInfo, LevelWarn, LevelError, LevelFatal
-	Level slog.Level
+	// Must be one of type slog.level: LevelTrace, LevelDebug, LevelInfo, LevelWarn, LevelError, LevelFatal
+	level slog.Level
 
-	// Defines the log format. Use FormatJSON in production mode so log aggregators can
+	// format defines the log format. Use FormatJSON in production mode so log aggregators can
 	// receive data in parsable format. In local development mode, Use FormatText to
-	// receive pretty output and stacktraces to stdout. For custom slog.Handler, create a new httplog.Format.
+	// receive pretty output and stacktraces to stdout. For custom slog.Handler, create a new httplog.format.
 	//
-	// FormatJSON will use slog.NewJSONHandler, FormatText will use slog.NewTextHandler.
-	// Must be one of type Format: FormatJSON, FormatText
-	Format Format
+	// "json" will use slog.NewJSONHandler, otherwise slog.NewTextHandler will be used
+	format string
 
-	// Concise mode includes fewer log details during the request flow. For example
-	// excluding details like request content length, user-agent and other details.
-	// This is useful if during development your console is too noisy.
-	Concise bool
-
-	// Additional fields included at the root level of all logs.
+	// tags are additional fields included at the root level of all logs.
 	// These can be useful for example the commit hash of a build, or an environment
 	// name like prod/stg/dev
-	Tags map[string]string
-
-	// Set containing headers which values are considered sensitive. Will be omitted if LeakSensitiveValues is false.
-	//
-	// Default key automatically added: "authorization", "cookie", "set-cookie"
-	SensitiveHeaders map[string]struct{}
-
-	// Should always be set to false. If set to true, sensitive data depending on the implementation
-	// will be displayed in the logs (i.e SensitiveHeaders).
-	LeakSensitiveValues bool
+	tags map[string]string
 }
 
-var Opt = Options{
-	Level:               LevelInfo,
-	Format:              FormatJSON,
-	Concise:             false,
-	Tags:                nil,
-	SensitiveHeaders:    nil,
-	LeakSensitiveValues: false,
+var defaultOptions = &options{
+	level:  LevelInfo,
+	format: "json",
+	tags:   nil,
+}
+
+type Option func(*options)
+
+func evaluateOptions(opts []Option) *options {
+	optCopy := &options{}
+	*optCopy = *defaultOptions
+	for _, o := range opts {
+		o(optCopy)
+	}
+	return optCopy
 }
 
 // Create a slog.Handler based on the options given in opt.
-func NewLogger(opt Options) *slog.Logger {
-	if opt.SensitiveHeaders == nil {
-		opt.SensitiveHeaders = make(map[string]struct{})
-	}
-	opt.SensitiveHeaders["authorization"] = struct{}{}
-	opt.SensitiveHeaders["cookie"] = struct{}{}
-	opt.SensitiveHeaders["set-cookie"] = struct{}{}
-
-	Opt = opt
-
+func NewLogger(options ...Option) *slog.Logger {
+	o := evaluateOptions(options)
 	var handler slog.Handler
-
 	handlerOpt := slog.HandlerOptions{
-		Level: opt.Level,
+		Level: o.level,
 		ReplaceAttr: func(groups []string, a slog.Attr) slog.Attr {
 			if a.Key == slog.LevelKey {
 				level := a.Value.Any().(slog.Level)
@@ -99,7 +78,7 @@ func NewLogger(opt Options) *slog.Logger {
 			return a
 		},
 	}
-	if opt.Format == FormatJSON {
+	if o.format == "json" {
 		handler = slog.NewJSONHandler(os.Stdout, &handlerOpt)
 	} else {
 		handler = slog.NewTextHandler(os.Stdout, &handlerOpt)
@@ -107,18 +86,53 @@ func NewLogger(opt Options) *slog.Logger {
 
 	l := slog.New(handler)
 
-	if opt.ServiceName != "" {
-		l = l.With(slog.String("service", opt.ServiceName))
+	if o.serviceName != "" {
+		l = l.With(slog.String("service", o.serviceName))
 	}
 
-	if !opt.Concise {
-		var tags []any
-		for k, v := range opt.Tags {
-			tags = append(tags, k, v)
+	if len(o.tags) > 0 {
+		var tags []any // slog.Attr
+		for k, v := range o.tags {
+			tags = append(tags, slog.String(k, v))
 		}
-		tagsAttr := slog.Group("tags", tags...)
-		l = l.With(tagsAttr)
+		l = l.With(slog.Group("tags", tags...))
 	}
 
 	return l
+}
+
+func WithServiceName(serviceName string) Option {
+	return func(o *options) {
+		o.serviceName = serviceName
+	}
+}
+
+func WithLevel(level slog.Level) Option {
+	return func(o *options) {
+		o.level = level
+	}
+}
+
+func WithFormat(format string) Option {
+	return func(o *options) {
+		if format == "json" {
+			o.format = format
+		} else {
+			o.format = "text"
+		}
+	}
+}
+
+func WithTags(t map[string]string) Option {
+	return func(o *options) {
+		// https://github.com/uber-go/guide/blob/master/style.md#copy-slices-and-maps-at-boundaries
+		if t == nil {
+			o.tags = make(map[string]string, 0)
+		} else {
+			o.tags = make(map[string]string, len(t))
+			for k, v := range t {
+				o.tags[k] = v
+			}
+		}
+	}
 }
